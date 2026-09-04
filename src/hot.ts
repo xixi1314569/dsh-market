@@ -20,7 +20,7 @@ import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { asChannel, type Channel } from './channels.ts'
-import { asRegion, type Region } from './regions.ts'
+import { asRegion, normalizeGithubProxy, type Region } from './regions.ts'
 import { logEvent } from './log.ts'
 
 interface HotRow {
@@ -217,6 +217,14 @@ export interface MarketState {
    * downloads oddly.
    */
   regionAuto?: boolean
+  /**
+   * Catalog entry URLs the user bookmarked for later install (#414).
+   * Keys are registry `url` strings, not package names — favorites are a
+   * pre-install list, unlike groups/notes which target installed packages.
+   */
+  favorites?: string[]
+  /** User-supplied HTTPS prefix used when the built-in GitHub routes fail. */
+  githubProxy?: string
 }
 
 /** Unique non-empty strings in `value`, order preserved. */
@@ -230,6 +238,14 @@ function uniqueStrings(value: unknown): string[] {
     out.push(item)
   }
   return out
+}
+
+/** Upper bound on bookmarked catalog URLs kept in state.json (#414). */
+export const MAX_FAVORITES = 500
+
+/** Catalog URLs the user may favorite; http(s) only, order preserved. */
+function favoriteUrls(value: unknown): string[] {
+  return uniqueStrings(value).filter(url => url.startsWith('http://') || url.startsWith('https://'))
 }
 
 /**
@@ -251,7 +267,9 @@ export function readMarketState(profileDir: string): MarketState {
       channel?: unknown
       region?: unknown
       regionAuto?: unknown
+      githubProxy?: unknown
       notes?: unknown
+      favorites?: unknown
     }
     const disabled = uniqueStrings(state.disabled !== undefined ? state.disabled : state.disabledSkins)
     const groups: Record<string, string[]> = {}
@@ -268,6 +286,7 @@ export function readMarketState(profileDir: string): MarketState {
         if (typeof text === 'string' && text.trim() !== '') notes[name] = text.slice(0, MAX_NOTE)
       }
     }
+    const githubProxy = normalizeGithubProxy(state.githubProxy)
     return {
       disabled: new Set(disabled),
       groups,
@@ -278,30 +297,76 @@ export function readMarketState(profileDir: string): MarketState {
       // Only meaningful beside a region, and only when true: a stray flag
       // with no region would promise a notice about a choice nobody made.
       regionAuto: state.regionAuto === true && asRegion(state.region) !== null ? true : undefined,
+      favorites: favoriteUrls(state.favorites),
+      ...(githubProxy === null ? {} : { githubProxy }),
     }
   } catch {
-    return { disabled: new Set(), groups: {}, groupOrder: [], notes: {} }
+    return { disabled: new Set(), groups: {}, groupOrder: [], notes: {}, favorites: [] }
   }
 }
 
-/** Persist the whole market state; `disabled` is the single written key. */
+/**
+ * Persist the whole market state.
+ *
+ * Every field a caller does not carry forward is taken from disk rather than
+ * dropped. Several callers legitimately know about only one part of the
+ * state — `writeMarketState(dir, { disabled, groups, groupOrder })` appears
+ * at five call sites in routes.ts — and before #435 that shape silently
+ * erased whatever else the user had chosen:
+ *
+ * - `channel` and `region` had no fallback at all, so toggling any plugin
+ *   threw away the user's update channel and download region. Both are
+ *   deliberate choices made through the settings card, and neither has a
+ *   "clear it" path: once picked they only ever move to another value. So
+ *   an absent one always means "the caller has nothing to say", never
+ *   "the user unchose it".
+ * `notes` keeps its original rule — an explicit object wins, including an
+ * empty one, because deleting the last note has to be expressible. What made
+ * #435 lose notes was not this function but a caller: the note route wrote
+ * through a fresh read while the long-lived `marketState` in routes.ts still
+ * carried `notes: {}` from boot, and the next write from that object put the
+ * empty one back. The fix for that belongs at the call site, where the two
+ * copies are, not here — see the note route.
+ *
+ * Reading before writing costs one small JSON parse on an operation that is
+ * already doing filesystem work, and it is what makes "this function writes
+ * the whole document" safe for callers that only hold part of it.
+ */
 export function writeMarketState(profileDir: string, state: MarketState): void {
   mkdirSync(join(profileDir, HOT_DIR), { recursive: true, mode: 0o700 })
-  // Absent means "keep what is on disk", not "clear it". Only an explicit
-  // empty object erases every note.
-  const notes = state.notes ?? readMarketState(profileDir).notes ?? {}
+  const onDisk = readMarketState(profileDir)
+  // `?? {}` only for the type: MarketState declares notes optional, while
+  // readMarketState always returns an object.
+  const notes = state.notes ?? onDisk.notes ?? {}
+  const channel = state.channel ?? onDisk.channel
+  const region = state.region ?? onDisk.region
+  // Unlike channel and region, regionAuto has an explicit clear path: a
+  // manual region choice owns this field and sets it to undefined. Preserve
+  // the disk value only when the caller omitted the property entirely.
+  const regionAuto = Object.prototype.hasOwnProperty.call(state, 'regionAuto')
+    ? state.regionAuto
+    : onDisk.regionAuto
+  const favorites = state.favorites ?? onDisk.favorites ?? []
+  // This field does have a clear action ("restore automatic"). As with
+  // regionAuto, omission preserves while an explicit undefined removes it.
+  const githubProxy = Object.prototype.hasOwnProperty.call(state, 'githubProxy')
+    ? state.githubProxy
+    : onDisk.githubProxy
   writeFileSync(stateFile(profileDir), JSON.stringify({
     disabled: [...state.disabled],
     groups: state.groups,
     groupOrder: state.groupOrder,
+    ...(favorites.length > 0 ? { favorites } : {}),
     ...(Object.keys(notes).length > 0 ? { notes } : {}),
     // Omitted while unchosen, so "never picked" survives a round trip and
-    // keeps deriving from the running build.
-    ...(state.channel === undefined ? {} : { channel: state.channel }),
+    // keeps deriving from the running build — but only when disk has not
+    // recorded a choice either.
+    ...(channel === undefined ? {} : { channel }),
     // Same reasoning, different consequence: an absent region is what makes
     // the probe run, so writing a default here would mean it never does.
-    ...(state.region === undefined ? {} : { region: state.region }),
-    ...(state.regionAuto === true ? { regionAuto: true } : {}),
+    ...(region === undefined ? {} : { region }),
+    ...(regionAuto === true ? { regionAuto: true } : {}),
+    ...(githubProxy === undefined ? {} : { githubProxy }),
   }))
 }
 

@@ -28,6 +28,25 @@ const OUT = 'docs'
 const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 const ldSafe = (s) => s.replaceAll('<', '\\u003c')
 
+// ── advertising ─────────────────────────────────────────────────────────────
+// One AdSense head tag, gated behind a build variable. Unset — the default —
+// emits nothing at all, so an unconfigured build is byte-identical to an
+// ad-free one and no third-party script is requested.
+//
+// Auto ads decide placement from this tag alone, so there is no slot markup to
+// write and no reserved height to get wrong. The publisher id is a `vars`
+// entry rather than a secret because it ships in the HTML either way.
+const ADSENSE_CLIENT = process.env.ADSENSE_CLIENT || ''
+const adHead = () =>
+  ADSENSE_CLIENT
+    ? `<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${esc(ADSENSE_CLIENT)}" crossorigin="anonymous"></script>\n`
+    : ''
+// The token sits on its own line in every template, so the match takes the
+// newline with it. Otherwise an unconfigured build leaves a blank line behind
+// and "identical to an ad-free build" stops being literally true — which is
+// the one claim about this feature worth being able to check by diffing.
+const AD_HEAD_TOKEN = '__AD_HEAD__\n'
+
 // A missing id here does not fail the build, it ships 1884 pages whose comment
 // box silently talks to the wrong repository — so check the shape up front and
 // stop, rather than discovering it from a user's report.
@@ -86,7 +105,11 @@ for (const f of fs.readdirSync('site/assets')) {
   fs.mkdirSync(`${OUT}/assets`, { recursive: true })
   fs.copyFileSync(`site/assets/${f}`, `${OUT}/assets/${f}`)
 }
-for (const f of ['CNAME', 'robots.txt']) fs.copyFileSync(`site/${f}`, `${OUT}/${f}`)
+// ads.txt ships unconditionally, unlike the ad tag above. It is a claim about
+// who is allowed to sell this domain's inventory, which stays true whether or
+// not a tag is currently live, and AdSense verifies site ownership from it — so
+// it has to exist before the review, not after.
+for (const f of ['CNAME', 'robots.txt', 'ads.txt']) fs.copyFileSync(`site/${f}`, `${OUT}/${f}`)
 
 // ── README rendering ────────────────────────────────────────────────────────
 // Same image policy as the catalog site, for the same reason: a README is
@@ -287,6 +310,7 @@ for (const loc of LOCALES) {
       .replaceAll('__BROWSE__', () => loc.browsePath)
       .replaceAll('__HOME_CSS__', () => (landing ? homeCss() : ''))
       .replaceAll('__HOME_CATALOG__', () => (landing ? homeCatalog(loc) : ''))
+      .replaceAll(AD_HEAD_TOKEN, () => (landing ? adHead() : ''))
     page = applyStrings(page, loc)
     if (urlPath === '/') fs.writeFileSync(`${OUT}/index.html`, page)
     else write(urlPath, page)
@@ -321,6 +345,7 @@ ${c.items.map((p) => `    <li><a href="${pluginPath(loc, p.slug)}"><span class="
     .replaceAll('__LOCALE_LINKS__', () => localeLinks(loc, (l) => l.browsePath))
     .replaceAll('__JUMP__', () => jump)
     .replaceAll('__SECTIONS__', () => sections)
+    .replaceAll(AD_HEAD_TOKEN, () => adHead())
   write(loc.browsePath, applyStrings(page, loc))
 }
 
@@ -454,7 +479,7 @@ ${readmeHtml}
       .replaceAll('__TITLE__', () => esc(loc.P_TITLE.replace('{NAME}', p.displayName)))
       .replaceAll('__DESC__', () => esc(metaDesc))
       .replaceAll('__URL__', () => url)
-      .replaceAll('__HREFLANGS__', () => hreflangs((l) => pluginPath(l, p.slug)))
+      .replaceAll('__CANONICAL__', () => CATALOG + pluginPath(loc, p.slug))
       .replaceAll('__OG_IMAGE__', () => `${ORIGIN}/assets/demo-${loc.code}.png`)
       .replaceAll('__JSONLD__', () => ldSafe(jsonld))
       .replaceAll('__HOME__', () => loc.urlPath)
@@ -469,6 +494,7 @@ ${readmeHtml}
       .replaceAll('__P_SHOTS__', () => shotSection)
       .replaceAll('__P_LINKS__', () => links)
       .replaceAll('__P_RELATED__', () => relSection)
+      .replaceAll(AD_HEAD_TOKEN, () => adHead())
     write(pluginPath(loc, p.slug), applyStrings(page, loc))
   }
 }
@@ -488,12 +514,17 @@ const urlEntry = (pathFor, lastmod, freq) => LOCALES.map((l) => `  <url>
 ${alt(pathFor)}
   </url>`).join('\n')
 
+// Plugin pages are deliberately absent. They canonicalize to
+// awesome-dsh-plugin.com (see plugin-template.html), and a sitemap is a list
+// of URLs we claim as canonical — submitting 4,900 URLs whose canonical says
+// "not this site" is what kept 920 of them parked in Search Console's
+// "Discovered - currently not indexed" bucket. The pages still exist and are
+// reachable from /browse/; they just are not put forward for indexing.
 const updated = registry.updated ?? new Date().toISOString().slice(0, 10)
 fs.writeFileSync(`${OUT}/sitemap.xml`, `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">
 ${urlEntry((l) => l.urlPath, updated, 'weekly')}
 ${urlEntry((l) => l.browsePath, updated, 'daily')}
-${plugins.map((p) => urlEntry((l) => pluginPath(l, p.slug), p.added ?? updated, 'weekly')).join('\n')}
 ${urlEntry((l) => l.privacyPath, updated, 'yearly')}
 </urlset>
 `)

@@ -47,10 +47,21 @@ export interface PnpmFailure {
   code: 'adding-to-root' | 'not-a-workspace' | 'hoist-pattern-diff' | 'pnpm-missing' | 'release-age-violation'
     | 'ignored-builds' | 'git-prepare-not-allowed' | 'fetch-404' | 'transient-network' | 'fetch-timeout'
     | 'unexpected-store' | 'patch-failed' | 'missing-tarball-integrity' | 'windows-file-locked'
+    | 'pnpm-unusable'
   /** Bilingual, actionable message shown to the user instead of the raw wall of text. */
   message: string
   /** True when re-running `pnpm install` in the profile is the documented recovery. */
   recoverable: boolean
+  /**
+   * Show this message INSTEAD of the captured output, not after it.
+   *
+   * Normally the raw text is worth keeping: it is pnpm's own account of what
+   * happened, and the explanation sits under it. Set only where the captured
+   * bytes carry nothing a user can read — cmd.exe writes its errors in the
+   * OEM code page, which arrives here as replacement characters, so pasting
+   * them under an explanation adds noise and hides the explanation (#502).
+   */
+  replaceOutput?: boolean
   /**
    * The package pnpm could not resolve, when the failure names one.
    *
@@ -116,14 +127,62 @@ function withDecodedPnpmDiagnostics(output: string): string {
 }
 
 /**
+ * Every package pnpm named as having no lockfile integrity, in order.
+ *
+ * Two shapes, because pnpm 11 rewrote this diagnostic and the market has to
+ * read both (verified against 10.28.2 / 11.21.0 / 11.22.0):
+ *
+ * - Up to pnpm 11.20, one package per error, quoted with its full URL:
+ *   `Cannot install package "name@https://…": its lockfile entry has no
+ *   "integrity" field`.
+ * - From pnpm 11.21, a supply-chain policy pass verifies the WHOLE lockfile
+ *   up front and reports every violator at once, as indented
+ *   `  name@version <reason>` lines under an `N lockfile entries failed
+ *   verification:` header (pnpm's own `formatEntry`; the mixed-code variant
+ *   inserts `[MISSING_TARBALL_INTEGRITY]` before the reason).
+ *
+ * Only the first shape was recognized, so on current pnpm the market fell
+ * back to a message that said an entry was bad without saying which one —
+ * and since pnpm refuses even to uninstall the offender, naming it is the
+ * whole of the user's recovery path (#422).
+ *
+ * The name is still never guessed. A candidate counts only when it carries a
+ * version-shaped suffix, which is what keeps a bare URL out and stops
+ * `alias@npm:real@1.0.0` from being read as `real` — `:` and `/` are absent
+ * from the version character class, and the lookbehind rejects a name that
+ * is really the tail of a longer token.
+ * @param diagnostic - decoded pnpm output.
+ * @returns the distinct package names, or an empty array when none is unambiguous.
+ */
+function integrityViolators(diagnostic: string): string[] {
+  const NAME = String.raw`(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*`
+  const found: string[] = []
+  const add = (name: string | undefined): void => {
+    if (name !== undefined && !found.includes(name)) found.push(name)
+  }
+  add(new RegExp(String.raw`Cannot (?:install|fetch) package\s+"(${NAME})@https?:\/\/[^"\s]+"(?: from the lockfile)?:\s*(?:its lockfile entry|it) has no "integrity" field`, 'i')
+    .exec(diagnostic)?.[1])
+  const listed = new RegExp(
+    String.raw`(?<![\w./:@-])(${NAME})@[A-Za-z0-9._+-]+(?:\s+\[MISSING_TARBALL_INTEGRITY\])? has no "integrity" field`,
+    'gi',
+  )
+  for (const match of diagnostic.matchAll(listed)) add(match[1])
+  return found
+}
+
+/**
  * Map a failed pnpm run's combined output to a known failure mode.
  *
  * dsh's own wrapper line ("dsh: pnpm failed in profile directory …") names no
  * cause, so the market must recognize pnpm's real diagnostics itself (#20).
  * @param output - stdout+stderr of the failed run.
+ * @param exitCode - the run's exit status, when the caller has it (null when
+ *   the process was signalled). Only a
+ *   failure whose whole signal IS the status reads it (#502); everything else
+ *   is recognized from what pnpm said.
  * @returns the classified failure, or null when unrecognized (raw output is then shown as-is).
  */
-export function classifyPnpmFailure(output: string): PnpmFailure | null {
+export function classifyPnpmFailure(output: string, exitCode?: number | null): PnpmFailure | null {
   if (output.includes('ERR_PNPM_PUBLIC_HOIST_PATTERN_DIFF')
     || output.includes('ERR_PNPM_VIRTUAL_STORE_DIR_MAX_LENGTH_DIFF')) {
     return {
@@ -166,20 +225,21 @@ export function classifyPnpmFailure(output: string): PnpmFailure | null {
   //
   // Do not auto-repair this. Computing and writing a hash means choosing to
   // trust the bytes currently served by the URL, which is a supply-chain
-  // decision the market cannot safely make for the user. We only name the
-  // package when pnpm emits its canonical quoted `name@https-url` shape;
-  // aggregate or reworded diagnostics get the generic message rather than a
-  // guessed package name.
+  // decision the market cannot safely make for the user. So the ONE thing
+  // this message has to get right is WHICH entry to remove — see
+  // integrityViolators for why that was previously lost on pnpm 11.
   if (output.includes('ERR_PNPM_MISSING_TARBALL_INTEGRITY')) {
-    const diagnostic = withDecodedPnpmDiagnostics(output)
-    const pkg = /Cannot (?:install|fetch) package\s+"((?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*)@https?:\/\/[^"\s]+"(?: from the lockfile)?:\s*(?:its lockfile entry|it) has no "integrity" field/i.exec(diagnostic)?.[1]
-    const zh = pkg === undefined ? '' : `（${pkg}）`
-    const en = pkg === undefined ? '' : ` (${pkg})`
+    const named = integrityViolators(withDecodedPnpmDiagnostics(output))
+    // Only a single unambiguous name goes in `pkg`: callers treat it as "the
+    // package this failure is about", which a list is not.
+    const pkg = named.length === 1 ? named[0] : undefined
+    const zh = named.length === 0 ? '' : `（${named.join('、')}）`
+    const en = named.length === 0 ? '' : ` (${named.join(', ')})`
     return {
       code: 'missing-tarball-integrity',
       recoverable: false,
       pkg,
-      message: `profile 的 pnpm-lock.yaml 里有一个 tarball 依赖${zh}缺少 integrity，pnpm 因此拒绝所有安装和卸载。请先确认 URL 和 tarball 可信，再重新解析/下载该依赖以写入 sha512 integrity，或从可信的 lockfile 版本恢复该字段，然后重试；市场不会自动为未验证的字节生成校验值 / a tarball dependency${en} in this profile's pnpm-lock.yaml has no integrity, so pnpm refuses every install and uninstall. Verify the URL and tarball first, then re-resolve/download that dependency to record a sha512 integrity, or restore the field from a trusted lockfile version before retrying; the market will not generate a checksum for unverified bytes automatically`,
+      message: `profile 的 pnpm-lock.yaml 里有 tarball 依赖${zh}缺少 integrity，pnpm 因此拒绝这个 profile 里的所有安装和卸载——包括卸载它自己，所以装不回来也删不掉。这种条目通常是旧版市场留下的：它把 GitHub 插件写成了带镜像前缀的 tarball 地址，pnpm 认不出那是 GitHub，就要求一个它自己从不为 GitHub 源写入的校验值。新版市场改为交给 pnpm 原生的 GitHub 地址，不会再产生这种条目（#385）。请在 pnpm-lock.yaml 里删掉上面点名的那条依赖记录后重试，市场会用当前方式把它重新装回来；不要删整个 pnpm-lock.yaml，那会让其余插件全部重新解析版本。市场不会自动为未经验证的字节生成校验值 / a tarball dependency${en} in this profile's pnpm-lock.yaml has no integrity, so pnpm refuses every install and uninstall in this profile — including uninstalling that dependency itself, so it can be neither repaired nor removed. Entries like this usually come from an older market version, which installed GitHub plugins from a mirror-prefixed tarball URL: pnpm cannot tell that is GitHub, so it demands a checksum it never writes for GitHub sources. Current versions hand pnpm its own native GitHub target instead and no longer produce such entries (#385). Delete the named dependency's entry from pnpm-lock.yaml and retry — the market will reinstall it the current way. Do not delete the whole pnpm-lock.yaml; that re-resolves the versions of every other plugin too. The market will not generate a checksum for unverified bytes automatically`,
     }
   }
   // #222 by @MicroMilo: a patch in the profile that no longer applies.
@@ -327,6 +387,29 @@ export function classifyPnpmFailure(output: string): PnpmFailure | null {
       code: 'pnpm-missing',
       recoverable: false,
       message: '找不到 pnpm，请先在市场页顶部一键安装组件 / pnpm is not on PATH — use the one-click setup at the top of the market page',
+    }
+  }
+  // #502 by @Ztyss: a pnpm WAS found on PATH and could not be started.
+  //
+  // Different from `pnpm-missing` in the one way that matters to the user:
+  // the market's own setup does not fix it, because as far as PATH is
+  // concerned pnpm is already there. The reported case is a `pnpm.cmd`
+  // wrapper built out of environment variables that only exist in its
+  // installer's own process — expanded in the market's child process it
+  // collapses to an empty command, and cmd.exe answers 9009 with its message
+  // in the OEM code page, which reaches us as replacement characters. Three
+  // updates in a row failed showing the user nothing but that.
+  //
+  // 9009 is cmd.exe's "command not found" and is language-independent, so it
+  // leads; the text forms catch the same failure in a log with no exit code.
+  // Last in the chain deliberately: pnpm's own errors never exit 9009, and
+  // anything pnpm actually said has already matched above.
+  if (exitCode === 9009 || /is not recognized as an internal or external command|不是内部或外部命令|不是內部或外部命令/.test(output)) {
+    return {
+      code: 'pnpm-unusable',
+      recoverable: false,
+      replaceOutput: true,
+      message: '找不到能用的 pnpm，插件没有任何改动。系统里确实有一个 pnpm，但它启动失败了（命令行退出码 9009）。可能是它其实没装好，也可能它是一个包装脚本、而脚本需要的环境变量在市场启动的子进程里不存在。在终端里执行一次 `pnpm --version` 就能分辨：那里同样失败，说明要修的是这台机器上的 pnpm；那里正常，说明是启动市场的方式带来的环境差异，改用普通的 `dsh web` 启动可以绕开。 / pnpm could not be started, and nothing was changed. A pnpm does exist on PATH, but launching it failed (command-line exit code 9009). Either that pnpm is not installed properly, or it is a wrapper script whose required environment variables are missing in the process the market spawns. Run `pnpm --version` in a terminal to tell them apart: failing there too means pnpm itself needs fixing on this machine; working there means the difference comes from how the market was launched, and starting dsh with a plain `dsh web` avoids it.',
     }
   }
   return null

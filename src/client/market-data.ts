@@ -4,6 +4,7 @@
  */
 
 import type { DiagnosticReportV1 } from '../diagnostics.ts'
+import { findCatalogEntryForLocal } from '../catalog-local-match.ts'
 export type { SharedHostPackageDependencyFinding } from '../diagnostics.ts'
 
 /** Localized text keyed by language ('zh' / 'en'). */
@@ -36,7 +37,7 @@ export interface RegistryPlugin {
   name: string
   owner: string
   url: string
-  npm?: string
+  npm?: string | null
   tarball?: string | null
   /** One legacy category id or several category ids. */
   category: string | string[]
@@ -75,10 +76,23 @@ export function pluginCategories(plugin: Pick<RegistryPlugin, 'category'>): stri
 
 /** The catalog payload under `registry` in /dsh-market/registry. */
 export interface Registry {
+  /** Catalog generation marker; unchanged payload generations share caches. */
+  updated: string
   count: number
   categories: Record<string, LocalizedText>
   plugins: RegistryPlugin[]
 }
+
+/** Discovery-time verdict derived from a package's public npm manifest. */
+export interface HostCompatibility {
+  status: 'compatible' | 'incompatible' | 'unknown'
+  basis: 'manifest' | 'undeclared' | 'unavailable'
+  requirement: string | null
+  declarations: Array<{ kind: 'engine' | 'peer'; package?: string; range: string }>
+}
+
+/** npm package name -> discovery-time host verdict. */
+export type HostCompatibilityMap = Record<string, HostCompatibility>
 
 /** Profile dependency map: package name → install spec. */
 export type InstalledMap = Record<string, string>
@@ -120,6 +134,10 @@ export interface UpdateStatus {
       the range between them in whichever form reads best. */
   current?: string | null
   latest?: string | null
+  /** Updating this local package switches it to its matched online release. */
+  restoreRequired?: boolean
+  /** Explicit source migration; never part of update-all. */
+  sourceMigration?: { kind: 'git-to-npm'; repo: string; target: string }
 }
 
 /** Poll payload from /dsh-market/status. */
@@ -128,11 +146,17 @@ export interface MarketStatus {
   version?: string
   /** Whether the profile package manager owns the market dependency. */
   selfManaged?: boolean
-  /**
-   * Prefix to put in front of github.com URLs the BROWSER loads, or null to
-   * address them directly. Resolved by the server from the download region.
-   */
+  /** Legacy single prefix for browser bundles predating githubRoutes. */
   githubProxy?: string | null
+  /** Ordered per-service routes; null means the canonical GitHub URL. */
+  githubRoutes?: {
+    raw?: Array<string | null>
+    avatar?: Array<string | null>
+  }
+  /** Saved UI escape route, if any. */
+  githubProxyCustom?: string | null
+  /** True when DSHM_GITHUB_PROXY owns the effective route. */
+  githubProxyManaged?: boolean
   active?: boolean
   lastLine?: string
   seconds?: number
@@ -160,6 +184,12 @@ export interface MarketStatus {
    * button is missing instead of just omitting it (#229).
    */
   supervisor?: string | null
+  /**
+   * Debugger latch (#447): `'inspector'` when the host is under a debugger,
+   * or null/absent otherwise. Kept separate from `supervisor` and from
+   * `restart` so `allowRestart` settings are not conflated with debug state.
+   */
+  debugger?: string | null
 }
 
 /** Post-install activation state (P0-2), per installed package. */
@@ -197,6 +227,8 @@ export interface InstalledPayload {
   groups?: Record<string, string[]>
   /** Display order of group names. */
   groupOrder?: string[]
+  /** Catalog entry URLs bookmarked for later install (#414). */
+  favorites?: string[]
 }
 
 /**
@@ -299,6 +331,10 @@ export interface ListQuery {
   sort: string
   /** Keep only plugins published within the last N days; undefined = any time. */
   sinceDays?: number
+  /** Optional discovery metadata, keyed by the entry's npm package name. */
+  hostCompatibility?: HostCompatibilityMap
+  /** Hide only entries that are known to be incompatible; unknown stays visible. */
+  compatibleWithHost?: boolean
 }
 
 /**
@@ -312,31 +348,99 @@ export function isMarketItself(plugin: Pick<RegistryPlugin, 'name' | 'npm'>): bo
 }
 
 /**
- * The discover list: category filter, then the published-within window, then
- * search across name / owner / localized description / category ids and
- * localized category labels, then the selected sort.
- * Pure — the section renders exactly this.
+ * A single pass that inserts a separator after the character on the left of
+ * every Han ↔ Latin/number boundary. Punctuation is normalized separately
+ * below. Keeping this generic lets `MCP管理`, `管理MCP`, and `OAuth2授权`
+ * behave like their space-separated forms without product-specific aliases.
  */
-export function visiblePlugins(plugins: RegistryPlugin[], options: ListQuery): RegistryPlugin[] {
-  const query = options.query.trim().toLowerCase()
-  const list = plugins.filter((p) => {
-    if (isMarketItself(p)) return false
-    const categories = pluginCategories(p)
-    if (options.category !== 'all' && !categories.includes(options.category)) return false
-    if (options.sinceDays !== undefined && !withinDays(p.added, options.sinceDays)) return false
-    if (query === '') return true
-    const desc = (p.description && (p.description[options.lang] || p.description.en)) || ''
-    const categoryMatches = categories.some((category) => {
-      if (category.toLowerCase().includes(query)) return true
-      return Object.values(options.categories?.[category] ?? {}).some(
-        label => typeof label === 'string' && label.toLowerCase().includes(query),
-      )
-    })
-    return p.name.toLowerCase().includes(query)
-      || p.owner.toLowerCase().includes(query)
-      || desc.toLowerCase().includes(query)
-      || categoryMatches
-  })
+const searchScriptBoundary = /(?:\p{Script=Han}(?=[\p{Script=Latin}\p{N}])|[\p{Script=Latin}\p{N}](?=\p{Script=Han}))/gu
+
+/** Normalize package names, human text, and adjacent mixed-script terms alike. */
+function searchText(value: string): string {
+  return value.normalize('NFKC').toLowerCase()
+    .replace(searchScriptBoundary, '$& ')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim()
+    .replace(/\s+/g, ' ')
+}
+
+/**
+ * Normalized catalog fields are immutable for the lifetime of one registry
+ * entry. Keep them with that entry so typing does not repeat unicode
+ * normalization across the whole catalog, while replaced catalogs remain
+ * collectible. The raw query is intentionally not cached: it is normalized
+ * once per call and would otherwise grow the cache on every keystroke.
+ */
+const pluginSearchTextCache = new WeakMap<RegistryPlugin, Map<string, string>>()
+
+function cachedPluginSearchText(plugin: RegistryPlugin, value: string): string {
+  let fields = pluginSearchTextCache.get(plugin)
+  if (fields === undefined) {
+    fields = new Map()
+    pluginSearchTextCache.set(plugin, fields)
+  }
+  const hit = fields.get(value)
+  if (hit !== undefined) return hit
+  const normalized = searchText(value)
+  fields.set(value, normalized)
+  return normalized
+}
+
+/**
+ * Relevance within one field. Exact and prefix matches beat phrase matches;
+ * for a multi-word query every word must occur in the same field.
+ */
+function fieldRelevance(
+  plugin: RegistryPlugin,
+  value: string | undefined,
+  query: string,
+  tokens: string[],
+  weight: number,
+): number {
+  if (!value) return 0
+  const text = cachedPluginSearchText(plugin, value)
+  if (text === '' || !tokens.every(token => text.includes(token))) return 0
+  if (text === query) return weight + 300
+  if (text.startsWith(query)) return weight + 250
+  if (text.includes(query)) return weight + 200
+  return weight + 150
+}
+
+/**
+ * Search ranking is field-aware rather than a popularity-only filter:
+ * package identities outrank owners, descriptions, and categories. The
+ * selected popularity/date sort remains the tie-breaker between equally
+ * relevant entries.
+ */
+function pluginRelevance(
+  plugin: RegistryPlugin,
+  query: string,
+  tokens: string[],
+  lang: string,
+  categories: Record<string, LocalizedText> | undefined,
+): number {
+  const descriptions = plugin.description ?? {}
+  const preferredLocale = descriptions[lang] ? lang : descriptions.en ? 'en' : null
+  const preferredDescription = descriptions[lang] || descriptions.en
+  const otherDescriptions = Object.entries(descriptions)
+    .filter(([locale, value]) => locale !== preferredLocale && typeof value === 'string')
+    .map(([, value]) => value)
+  const categoryIds = pluginCategories(plugin)
+  const categoryLabels = categoryIds.flatMap(category => Object.values(categories?.[category] ?? {}))
+
+  return Math.max(
+    fieldRelevance(plugin, plugin.name, query, tokens, 700),
+    fieldRelevance(plugin, plugin.npm ?? undefined, query, tokens, 700),
+    fieldRelevance(plugin, plugin.owner, query, tokens, 400),
+    fieldRelevance(plugin, preferredDescription, query, tokens, 280),
+    ...otherDescriptions.map(value => fieldRelevance(plugin, value, query, tokens, 240)),
+    ...categoryIds.map(value => fieldRelevance(plugin, value, query, tokens, 180)),
+    ...categoryLabels.map(value => fieldRelevance(plugin, value, query, tokens, 180)),
+  )
+}
+
+/** Compare two already-filtered entries using the user's selected sort. */
+function comparePlugins(a: RegistryPlugin, b: RegistryPlugin, sort: string): number {
   // A github:-only entry has no npm package and therefore no download count
   // at all — that is a coverage gap, not a "0 downloads" verdict, and must
   // not be read as less popular than a package that genuinely has zero.
@@ -344,35 +448,71 @@ export function visiblePlugins(plugins: RegistryPlugin[], options: ListQuery): R
   // direction, and are ordered against each other by star count — the only
   // signal available for them — rather than left in an arbitrary tie.
   const hasDownloads = (p: RegistryPlugin): p is RegistryPlugin & { downloads: number } => typeof p.downloads === 'number'
-  if (options.sort === 'downloads-desc') {
-    return [...list].sort((a, b) => {
-      if (hasDownloads(a) && hasDownloads(b)) return b.downloads - a.downloads
-      if (hasDownloads(a)) return -1
-      if (hasDownloads(b)) return 1
-      return (b.stars ?? -1) - (a.stars ?? -1)
-    })
+  if (sort === 'downloads-desc') {
+    if (hasDownloads(a) && hasDownloads(b)) return b.downloads - a.downloads
+    if (hasDownloads(a)) return -1
+    if (hasDownloads(b)) return 1
+    return (b.stars ?? -1) - (a.stars ?? -1)
   }
-  if (options.sort === 'downloads-asc') {
-    return [...list].sort((a, b) => {
-      if (hasDownloads(a) && hasDownloads(b)) return a.downloads - b.downloads
-      if (hasDownloads(a)) return -1
-      if (hasDownloads(b)) return 1
-      return (a.stars ?? -1) - (b.stars ?? -1)
-    })
+  if (sort === 'downloads-asc') {
+    if (hasDownloads(a) && hasDownloads(b)) return a.downloads - b.downloads
+    if (hasDownloads(a)) return -1
+    if (hasDownloads(b)) return 1
+    return (a.stars ?? -1) - (b.stars ?? -1)
   }
-  if (options.sort === 'stars-desc') {
-    return [...list].sort((a, b) => (b.stars ?? -1) - (a.stars ?? -1))
-  }
-  if (options.sort === 'stars-asc') {
-    return [...list].sort((a, b) => (a.stars ?? -1) - (b.stars ?? -1))
-  }
-  if (options.sort === 'added-desc') {
-    return [...list].sort((a, b) => String(b.added).localeCompare(String(a.added)))
-  }
-  if (options.sort === 'added-asc') {
-    return [...list].sort((a, b) => String(a.added).localeCompare(String(b.added)))
-  }
-  return list
+  if (sort === 'stars-desc') return (b.stars ?? -1) - (a.stars ?? -1)
+  if (sort === 'stars-asc') return (a.stars ?? -1) - (b.stars ?? -1)
+  if (sort === 'added-desc') return String(b.added).localeCompare(String(a.added))
+  if (sort === 'added-asc') return String(a.added).localeCompare(String(b.added))
+  return 0
+}
+
+/**
+ * The discover list: category filter, then the published-within window, then
+ * relevance-ranked search across package identity / owner / every localized
+ * description / category ids and labels. With no search, only the selected
+ * sort applies, preserving the existing discover-list behaviour.
+ * Pure — the section renders exactly this.
+ */
+export function visiblePlugins(plugins: RegistryPlugin[], options: ListQuery): RegistryPlugin[] {
+  const query = searchText(options.query)
+  const tokens = query.split(' ').filter(Boolean)
+  const scored = plugins.flatMap((plugin, index) => {
+    if (isMarketItself(plugin)) return []
+    const categories = pluginCategories(plugin)
+    if (options.category !== 'all' && !categories.includes(options.category)) return []
+    if (options.sinceDays !== undefined && !withinDays(plugin.added, options.sinceDays)) return []
+    if (options.compatibleWithHost === true && plugin.npm != null
+      && options.hostCompatibility?.[plugin.npm]?.status === 'incompatible') return []
+    const relevance = query === '' ? 0 : pluginRelevance(plugin, query, tokens, options.lang, options.categories)
+    return relevance === 0 && query !== '' ? [] : [{ plugin, relevance, index }]
+  })
+
+  return scored.sort((a, b) =>
+    b.relevance - a.relevance
+    || comparePlugins(a.plugin, b.plugin, options.sort)
+    || a.index - b.index,
+  ).map(row => row.plugin)
+}
+
+/**
+ * Favorites tab listing: only bookmarked catalog entries, then the usual
+ * search/sort window. Pure — the section renders exactly this.
+ */
+export function pluginsForFavorites(
+  plugins: RegistryPlugin[],
+  favoriteUrls: ReadonlySet<string>,
+  options: Omit<ListQuery, 'category'>,
+): RegistryPlugin[] {
+  const subset = plugins.filter(plugin => favoriteUrls.has(plugin.url))
+  return visiblePlugins(subset, { ...options, category: 'all' })
+}
+
+/** Bookmarked URLs with no matching catalog entry — delisted or URL changed. */
+export function staleFavoriteUrls(urls: readonly string[], plugins: RegistryPlugin[]): string[] {
+  if (urls.length === 0) return []
+  const catalog = new Set(plugins.map(plugin => plugin.url))
+  return urls.filter(url => !catalog.has(url))
 }
 
 /** The themes tab listing: theme category only, most-starred first. */
@@ -415,9 +555,11 @@ export function orderedCategories(
 
 /**
  * Page-number list for the discover pager. With few pages it is simply
- * 1..total; with many it windows around the current page and inserts '…'
- * so a 400-plugin catalog stays a compact `1 … 4 5 6 … 17` instead of a
- * long row of numbered buttons. Always begins with 1 and ends with total.
+ * 1..total; with many it windows around the current page —
+ * `1 … n-1 n n+1 … total` (at most five numbered buttons) — so a
+ * 400-plugin catalog stays compact instead of a long row of numbered
+ * buttons. Always begins with 1 and ends with total, so the first/last
+ * pages stay one click away even without the pager's «/» shortcuts.
  */
 export function pageItems(current: number, total: number): Array<number | '…'> {
   if (total <= 7) {
@@ -425,11 +567,9 @@ export function pageItems(current: number, total: number): Array<number | '…'>
     for (let i = 1; i <= total; i++) all.push(i)
     return all
   }
+  const start = Math.max(2, current - 1)
+  const end = Math.min(total - 1, current + 1)
   const items: Array<number | '…'> = [1]
-  let start = Math.max(2, current - 1)
-  let end = Math.min(total - 1, current + 1)
-  if (current <= 4) end = 5
-  if (current >= total - 3) start = total - 4
   if (start > 2) items.push('…')
   for (let i = start; i <= end; i++) items.push(i)
   if (end < total - 1) items.push('…')
@@ -613,11 +753,22 @@ export function matchInstalledName(
 ): string | null {
   const ids = entryIdentities(plugin)
   for (const [name, spec] of Object.entries(installed)) {
+    const specStr = String(spec)
     const repos = repoIdentities[name] ?? []
-    if (depRepoIds(String(spec), repos).size === 0 && plugins !== undefined && looseMatchCount(plugins, name) > 1
+    // Discover badges and theme cards share this helper. Local link:/file:
+    // installs must use the same strict catalog row as restore and the
+    // Installed tab — a coincidental unique name must not mark someone
+    // else's fork as installed (#485).
+    if (/^(?:link|file):/i.test(specStr)) {
+      if (plugins === undefined) continue
+      const entry = findCatalogEntryForLocal(plugins, name, repos, repoHints[name] ?? [])
+      if (entry !== null && entry.url === plugin.url) return name
+      continue
+    }
+    if (depRepoIds(specStr, repos).size === 0 && plugins !== undefined && looseMatchCount(plugins, name) > 1
       && !repoHintMatches(plugin, repoHints[name] ?? [])) continue
-    if (sameSourceConflict(plugin, String(spec), repos)) continue
-    for (const id of depIdentities(name, String(spec), repos)) {
+    if (sameSourceConflict(plugin, specStr, repos)) continue
+    for (const id of depIdentities(name, specStr, repos)) {
       if (ids.has(id)) return name
     }
   }
@@ -676,33 +827,96 @@ export function themeSwatch(def: ThemeDef): string[] {
 // ------------------------------------------------------------- screenshots
 
 /**
- * Prefix for github.com URLs this page loads, or null to address them
- * directly. Set from the status poll, which gets it from the download region.
+ * Ordered routes for GitHub URLs this page loads. Set from the status poll,
+ * which resolves them from the download region on the server.
  *
- * Module state rather than a prop: the URLs it applies to are built in four
- * places across two files (avatars, README fetches, screenshot thumbnails),
- * and threading one string through every card would put it in signatures
- * that have no other reason to know about networking.
+ * Module state rather than a prop: avatars and README fetches are built in
+ * separate files, and threading the lists through every card would put them
+ * in signatures that have no other reason to know about networking.
  *
  * Applied at the LAST moment, never stored. Extracted image URLs stay
  * canonical, so changing region re-renders against the new route instead of
  * leaving a page full of links to a proxy the user just switched away from.
  */
-let githubProxy: string | null = null
+export type ClientGithubService = 'raw' | 'avatar'
+export interface ClientGithubRouteCandidate { proxy: string | null; url: string }
+export type ClientGithubRoutes = Partial<Record<ClientGithubService, Array<string | null>>>
 
-/** Point browser-side github.com requests at a proxy, or null for direct. */
+let githubRoutes: Record<ClientGithubService, Array<string | null>> = {
+  raw: [null],
+  avatar: [null],
+}
+const preferredGithubRoutes = new Map<ClientGithubService, string | null>()
+
+function cleanGithubRoutes(value: unknown, fallback: string | null): Array<string | null> {
+  if (!Array.isArray(value)) return [fallback]
+  const out: Array<string | null> = []
+  for (const item of value) {
+    if (item !== null && typeof item !== 'string') continue
+    const route = typeof item === 'string' ? item.trim().replace(/\/+$/u, '') : null
+    if (route === '' || out.includes(route)) continue
+    out.push(route)
+  }
+  return out.length === 0 ? [fallback] : out
+}
+
+/** Install server-resolved per-service candidates, with old-host fallback. */
+export function setGithubRoutes(routes: ClientGithubRoutes | undefined, fallback: string | null = null): void {
+  let changed = false
+  for (const service of ['raw', 'avatar'] as const) {
+    const next = cleanGithubRoutes(routes?.[service], fallback)
+    if (next.length === githubRoutes[service].length
+      && next.every((route, index) => route === githubRoutes[service][index])) continue
+    githubRoutes[service] = next
+    preferredGithubRoutes.delete(service)
+    changed = true
+  }
+  // Failed/empty README results are cached too. A route change is the user's
+  // explicit request to try a different path, so an old failure must not win.
+  if (changed) readmeShotsCache.clear()
+}
+
+/** Apply either a current status payload or its legacy single-prefix shape. */
+export function applyGithubRouting(status: Pick<MarketStatus, 'githubRoutes' | 'githubProxy'>): void {
+  setGithubRoutes(status.githubRoutes, typeof status.githubProxy === 'string' ? status.githubProxy : null)
+}
+
+/** Point every browser-side GitHub request at one legacy prefix. */
 export function setGithubProxy(proxy: string | null): void {
-  githubProxy = proxy
+  setGithubRoutes({ raw: [proxy], avatar: [proxy] }, proxy)
 }
 
-/** The proxy in force, for callers that must decide between two URL shapes. */
+/** First avatar prefix, retained for old consumers and tests. */
 export function githubProxyInUse(): string | null {
-  return githubProxy
+  return githubRoutes.avatar[0] ?? null
 }
 
-/** `url` through the proxy in force, or unchanged when there is none. */
+/** Candidates for one request, with that service's last winner first. */
+export function githubRouteCandidates(service: ClientGithubService, url: string): ClientGithubRouteCandidate[] {
+  const routes = [...githubRoutes[service]]
+  if (preferredGithubRoutes.has(service)) {
+    const preferred = preferredGithubRoutes.get(service)!
+    const index = routes.findIndex(route => route === preferred)
+    if (index > 0) routes.unshift(...routes.splice(index, 1))
+  }
+  return routes.map(proxy => ({ proxy, url: proxy === null ? url : `${proxy}/${url}` }))
+}
+
+/** Cache a route only after the consumer has validated its expected payload. */
+export function rememberGithubRoute(service: ClientGithubService, proxy: string | null): void {
+  preferredGithubRoutes.set(service, proxy)
+}
+
+/** Test/page-lifetime reset for both configured routes and learned winners. */
+export function resetGithubRouting(): void {
+  githubRoutes = { raw: [null], avatar: [null] }
+  preferredGithubRoutes.clear()
+}
+
+/** `url` through the first candidate for its host, retained for compatibility. */
 export function githubUrl(url: string): string {
-  return githubProxy === null ? url : `${githubProxy}/${url}`
+  const service: ClientGithubService = url.includes('avatars.githubusercontent.com') ? 'avatar' : 'raw'
+  return githubRouteCandidates(service, url)[0]!.url
 }
 
 /**
@@ -934,7 +1148,7 @@ export function rankThemeScreenshots(
 
 const readmeShotsCache = new Map<string, Promise<ScreenshotCandidate[]>>()
 
-/** Test hook: the cache is module-level and outlives component unmounts. */
+/** Clear README-derived media at the boundary of an accepted catalog generation. */
 export function resetScreenshotsCache(): void {
   readmeShotsCache.clear()
 }
@@ -955,12 +1169,27 @@ export function pluginScreenshotCandidates(plugin: RegistryPlugin): Promise<Scre
   const cached = readmeShotsCache.get(cacheKey)
   if (cached !== undefined) return cached
   const fetchReadme = async (path: string | null): Promise<string | null> => {
-    try {
-      const res = await fetch(githubUrl(`https://raw.githubusercontent.com/${owner}/${repo}/HEAD/${path === null ? '' : path + '/'}README.md`))
-      return res.ok ? await res.text() : null
-    } catch {
-      return null
+    const url = `https://raw.githubusercontent.com/${owner}/${repo}/HEAD/${path === null ? '' : path + '/'}README.md`
+    for (const candidate of githubRouteCandidates('raw', url)) {
+      const controller = new AbortController()
+      const timer = setTimeout(() => { controller.abort() }, 6000)
+      try {
+        const res = await fetch(candidate.url, { signal: controller.signal })
+        if (!res.ok) continue
+        const body = await res.text()
+        const contentType = res.headers.get('content-type')?.toLowerCase() ?? ''
+        // A public proxy's branded error document is not a README even when
+        // it carries HTTP 200. Validate before remembering the route.
+        if (contentType.includes('text/html') || /^\s*(?:<!doctype\s+html|<html[\s>])/iu.test(body)) continue
+        rememberGithubRoute('raw', candidate.proxy)
+        return body
+      } catch {
+        // Transport failure is exactly what the next candidate is for.
+      } finally {
+        clearTimeout(timer)
+      }
     }
+    return null
   }
   const task = (async () => {
     // Monorepo subpath entries prefer their own README, falling back to the
@@ -1062,4 +1291,21 @@ export function formatCount(n: number): string {
   if (!Number.isFinite(n) || n < 1000) return String(n)
   const k = Math.round(n / 100) / 10
   return `${Number.isInteger(k) ? k.toFixed(0) : k.toFixed(1)}k`
+}
+
+export { findCatalogEntryForLocal, resolveCatalogRestore } from '../catalog-local-match.ts'
+export type { CatalogRestoreReason } from '../catalog-local-match.ts'
+
+/** Catalog row for an installed dependency — strict for local link:/file: specs. */
+export function catalogEntryForInstalled(
+  plugins: RegistryPlugin[],
+  name: string,
+  spec: string,
+  repoIdentities: readonly string[] = [],
+  repoHints: readonly string[] = [],
+): RegistryPlugin | undefined {
+  if (/^(?:link|file):/i.test(spec)) {
+    return findCatalogEntryForLocal(plugins, name, repoIdentities, repoHints) ?? undefined
+  }
+  return entryForDep(plugins, name, spec, repoIdentities, repoHints)
 }

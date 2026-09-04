@@ -13,7 +13,7 @@
 import { chromium } from 'playwright'
 import type { Browser, Page } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { dshAvailable, launchMarketScaffold, watchConsole } from './scaffold.ts'
+import { dshAvailable, launchMarketScaffold, openMarketPage, watchConsole } from './scaffold.ts'
 import type { WebScaffold } from './scaffold.ts'
 
 const HAS_DSH = dshAvailable()
@@ -29,7 +29,7 @@ describe.skipIf(!HAS_DSH)('web e2e: plugin market', () => {
     browser = await chromium.launch()
     page = await browser.newPage({ viewport: { width: 1500, height: 950 } })
     tripwire = watchConsole(page)
-    await page.goto(scaffold.baseUrl, { waitUntil: 'load' })
+    await openMarketPage(page, scaffold)
     // A fresh home greets with onboarding dialogs (testing notice, API-key
     // prompt, …); click through whichever appear until none are left.
     const passes = /^(Continue|继续|Configure later|稍后配置)$/
@@ -63,6 +63,23 @@ describe.skipIf(!HAS_DSH)('web e2e: plugin market', () => {
     expect(cards).toBe(24)
     // Numbered pager: primitives Buttons inside the pager row.
     expect(await page.locator('[class*="pager"] button').count()).toBeGreaterThan(0)
+    // The pager must stay on ONE line inside the fixed-width settings dialog
+    // (800px panel − 188px nav − 48px padding → ~556px content column):
+    // every button aligns to one row and none is clipped past the row edge
+    // (a centered nowrap row overflows on BOTH sides, which the host's
+    // overflow-x hidden turns into invisible controls).
+    const pagerRow = page.locator('[class*="pager"]').first()
+    const layout = await pagerRow.evaluate(row => {
+      const rect = row.getBoundingClientRect()
+      const btns = [...row.querySelectorAll('button')].map(b => b.getBoundingClientRect())
+      const tops = new Set(btns.map(b => Math.round(b.top + b.height / 2)))
+      return {
+        oneRow: tops.size === 1,
+        clipped: btns.some(b => b.left < rect.left - 1 || b.right > rect.right + 1),
+      }
+    })
+    expect(layout.oneRow).toBe(true)
+    expect(layout.clipped).toBe(false)
   })
 
   it('shows its own version next to the heading', async () => {
@@ -128,6 +145,26 @@ describe.skipIf(!HAS_DSH)('web e2e: plugin market', () => {
     // ...and clearing the filter restores the full catalog, so a chip that
     // silently stuck would not read as a pass.
     expect(await pages()).toBe(allPages)
+  })
+
+  it('treats adjacent Han and Latin search terms like their spaced forms', async () => {
+    await page.getByRole('button', { name: /^(发现|Discover)$/ }).click()
+    const search = page.getByPlaceholder(/搜索插件|Search plugins/)
+    const gridNames = () => page.locator('[class*="masonryCol"] [class*="nm"]').allTextContents()
+
+    for (const [compact, spaced] of [['MCP管理', 'MCP 管理'], ['管理MCP', '管理 MCP']]) {
+      await search.fill(compact)
+      await page.waitForTimeout(400)
+      const compactNames = await gridNames()
+      expect(compactNames.length, `${compact} should recover mixed-script matches`).toBeGreaterThan(0)
+
+      await search.fill(spaced)
+      await page.waitForTimeout(400)
+      expect(await gridNames(), `${compact} and ${spaced} should rank identically`).toEqual(compactNames)
+    }
+
+    await search.fill('')
+    await page.waitForTimeout(200)
   })
 
   it('never lists the market itself in the Installed tab — it manages itself from its own settings card', async () => {

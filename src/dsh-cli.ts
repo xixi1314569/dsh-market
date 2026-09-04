@@ -320,6 +320,19 @@ export interface InstallResult {
    */
   pnpmError?: string
   pnpmErrorCode?: string
+  /**
+   * Exact npm version this Desktop run actually handed to the host (#496).
+   *
+   * Anywhere Labs' install boundary rewrites a floating dist-tag (or bare
+   * name) to `name@x.y.z` with its own registry fetch. The update route
+   * normally pins that version itself before `add`, so this field matches
+   * the request and is unused for verification. It matters when registry
+   * metadata was unavailable and the add still carried `@latest`/`@beta`:
+   * verification then adopts this pin instead of leaving the expected
+   * version unset. When the route already sent an exact pin, callers must
+   * keep that pin authoritative and must not let this field lower it.
+   */
+  resolvedNpmVersion?: string
 }
 
 /** The shape every orchestration function takes to run plugin commands (injectable in tests). */
@@ -331,6 +344,8 @@ export interface PluginCommandRuntime {
   probePnpm(): Promise<boolean>
   provisionPnpm(): Promise<{ ok: boolean; hint?: string }>
   cancelActive(): boolean
+  /** Whether this host can execute an immutable rollback add target. */
+  supportsExactRollbackTarget?(target: string): boolean
 }
 
 /** One running package operation, however it was started. */
@@ -404,9 +419,9 @@ const EXACT_NPM_TARGET_RE = /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~
  * Their validator wants exactly one target of the form `name@1.2.3` — not a
  * bare name, not `@latest`, and not a `github:` source (read from
  * `validateExternalMarketInstallArgs`, dsh-plugin-desktop/src/pnpm.ts). The
- * market sends a bare name for a registry plugin and `dshmarket@latest` for
- * itself, so both need the version resolved before that boundary will take
- * them.
+ * market prefers to send an already-resolved `name@x.y.z` for npm updates
+ * (#496); a bare name or dist-tag still needs resolving here when some other
+ * path hands one over.
  *
  * Returning null is a normal outcome, not a failure: a github-sourced plugin
  * has no `name@version` spelling at all. The caller falls back to the
@@ -426,11 +441,18 @@ const NPM_ONLY_HOST_NOTE
   + 'That is the client\'s install boundary, not a fault in the plugin or the market. '
   + 'Install it from plain dsh web instead, or ask the author to publish to npm.'
 
-async function exactNpmArgs(args: readonly string[]): Promise<string[] | null> {
+async function exactNpmArgs(args: readonly string[]): Promise<{
+  args: string[]
+  resolvedNpmVersion: string
+} | null> {
   const targets = args.slice(1).filter(argument => !argument.startsWith('-'))
   const target = targets[0]
   if (targets.length !== 1 || target === undefined) return null
-  if (EXACT_NPM_TARGET_RE.test(target)) return [...args]
+  if (EXACT_NPM_TARGET_RE.test(target)) {
+    // Already exact — still report the pin so update verification can align
+    // with what this host will install, not with a separate `latest` fetch.
+    return { args: [...args], resolvedNpmVersion: target.slice(target.lastIndexOf('@') + 1) }
+  }
   // A bare name, or one pinned to a dist-tag. Only a registry package can be
   // resolved; `github:owner/repo` and file paths stop here.
   const at = target.lastIndexOf('@')
@@ -441,7 +463,10 @@ async function exactNpmArgs(args: readonly string[]): Promise<string[] | null> {
   const rewritten = `${name}@${version}`
   if (!EXACT_NPM_TARGET_RE.test(rewritten)) return null
   logEvent('info', 'install', `desktop install boundary needs an exact version: ${target} -> ${rewritten}`)
-  return args.map(argument => (argument === target ? rewritten : argument))
+  return {
+    args: args.map(argument => (argument === target ? rewritten : argument)),
+    resolvedNpmVersion: version,
+  }
 }
 
 /** Desktop runtime also owns cleanup of any operation started by this fiber. */
@@ -603,7 +628,10 @@ export async function provisionPnpm(): Promise<{ ok: boolean; hint?: string }> {
   // instead of telling the user a successful install failed.
   if (npm.code === 0 || corepack.code === 0) {
     const prefix = await runQuiet('npm', ['prefix', '-g'], 30 * 1000)
-    const bin = prefix.code === 0 ? join(prefix.output.trim().split('\n').pop() ?? '', 'bin') : ''
+    const root = prefix.code === 0 ? prefix.output.trim().split('\n').pop() ?? '' : ''
+    // `npm prefix -g` already is the executable directory on Windows
+    // (`pnpm.cmd` lives directly under it). Unix keeps shims in `bin/`.
+    const bin = root === '' ? '' : process.platform === 'win32' ? root : join(root, 'bin')
     if (bin !== '' && isAbsolute(bin) && !extraPathDirs.includes(bin)) {
       extraPathDirs.push(bin)
       logEvent('info', 'setup-pnpm', `added npm's global bin to the probe path: ${bin}`)
@@ -938,6 +966,8 @@ export function createDesktopPluginRuntime(
     let handle: DesktopPnpmHandleLike
     /** Set when this host only installs npm packages and the target is not one. */
     let boundaryRefusesTarget = false
+    /** Exact npm pin the install boundary actually sent (#496). */
+    let resolvedNpmVersion: string | undefined
     try {
       // `add` goes through Anywhere Labs' install boundary when that host
       // publishes one, because their Desktop rejects `add` on `runPlugin`
@@ -953,9 +983,10 @@ export function createDesktopPluginRuntime(
       // catalog has no npm package — reported in #138 after the user found
       // out by clicking Install and reading `exit 127`.
       boundaryRefusesTarget = boundary !== undefined && viaBoundary === null
+      if (viaBoundary !== null) resolvedNpmVersion = viaBoundary.resolvedNpmVersion
       handle = boundary === undefined || viaBoundary === null
         ? service.runPlugin(prepared.args, invokingDir, abort.signal)
-        : boundary.call(service, viaBoundary, invokingDir, abort.signal)
+        : boundary.call(service, viaBoundary.args, invokingDir, abort.signal)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       const busy = /another desktop pnpm operation is already running/i.test(message)
@@ -1007,6 +1038,7 @@ export function createDesktopPluginRuntime(
           ...(ignoredBuilds.length > 0 ? { ignoredBuilds } : {}),
           ...(pnpmError !== null ? { pnpmError } : {}),
           ...(pnpmErrorCode !== null ? { pnpmErrorCode } : {}),
+          ...(resolvedNpmVersion !== undefined ? { resolvedNpmVersion } : {}),
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
@@ -1018,6 +1050,7 @@ export function createDesktopPluginRuntime(
           stdout,
           stderr: boundaryRefusesTarget ? `${detail}\n${NPM_ONLY_HOST_NOTE}` : detail,
           cancelled: active.userCancelled,
+          ...(resolvedNpmVersion !== undefined ? { resolvedNpmVersion } : {}),
         }
       } finally {
         if (timer !== undefined) clearTimeout(timer)
@@ -1053,6 +1086,11 @@ export function createDesktopPluginRuntime(
 
   return {
     runPlugin,
+    // Anywhere Labs' optional external boundary accepts exact npm targets
+    // only. Every Desktop host without that boundary retains the ordinary
+    // CLI grammar, including immutable Git and archive targets.
+    supportsExactRollbackTarget: target => TARGET_RE.test(target)
+      && (service.runExternalMarketPluginInstall === undefined || EXACT_NPM_TARGET_RE.test(target)),
     // The service is backed by Desktop's packaged pnpm; system discovery and
     // global provisioning are neither needed nor allowed in this mode.
     probePnpm: () => Promise.resolve(true),

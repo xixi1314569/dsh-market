@@ -10,10 +10,38 @@
  */
 
 import { spawn } from 'node:child_process'
+import { readFileSync } from 'node:fs'
+import inspector from 'node:inspector'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { IncomingMessage } from 'node:http'
 import { dshArgv, nodeExecutable } from './dsh-cli.ts'
+
+/** Vitest / flows can pin detection without opening a real inspector port. */
+let debuggerOverride: 'inspector' | null | undefined
+
+/** @internal test hook — production callers use detectedDebugger() only. */
+export function setDetectedDebuggerOverride(value: 'inspector' | null | undefined): void {
+  debuggerOverride = value
+}
+
+const INSPECT_ARG_PREFIXES = ['--inspect', '--inspect-brk', '--inspect-port', '--inspect-wait'] as const
+
+function tokenHasInspectFlag(token: string): boolean {
+  for (const prefix of INSPECT_ARG_PREFIXES) {
+    if (token === prefix || token.startsWith(`${prefix}=`)) return true
+  }
+  if (token === '--debug-brk' || token.startsWith('--debug-brk=')) return true
+  if (token === '--debug' || token.startsWith('--debug=')) return true
+  return false
+}
+
+function argvHasInspectFlag(tokens: readonly string[]): boolean {
+  for (const token of tokens) {
+    if (tokenHasInspectFlag(token)) return true
+  }
+  return false
+}
 
 /**
  * The process supervisor running this host, when one can be identified —
@@ -37,9 +65,20 @@ import { dshArgv, nodeExecutable } from './dsh-cli.ts'
  * large population of hosts where it works fine, which is a worse bug than
  * the one being fixed.
  *
- * `ppid === 1` is what distinguishes being the unit's own main process from
- * merely descending from one: systemd forks its services from PID 1, while a
- * terminal's node has the shell as its parent and a runner's has the agent.
+ * The parent test is what distinguishes being the unit's own main process
+ * from merely descending from one: a terminal's node has the shell as its
+ * parent and a runner's has the agent. It used to be `ppid === 1`, which is
+ * only true for SYSTEM units. A per-user unit's service is forked by that
+ * user's manager instance — `systemd --user`, an ordinary PID — so user-unit
+ * hosts read as unsupervised, and one-click restart killed them for good
+ * (#471 by @automagik-genie, with the journal to prove the whole chain:
+ * clean SIGTERM exit → `Restart=on-failure` does not fire → `KillMode=mixed`
+ * SIGKILLs the detached helper before it can spawn the replacement). So the
+ * parent counts as a manager when it is PID 1 or its comm is `systemd` —
+ * the one name both manager instances share and the false-positive parents
+ * (shells, CI agents) never carry. `/proc` is Linux-only, which is exactly
+ * as wide as systemd itself; anywhere it cannot be read the answer stays
+ * "not a manager".
  *
  * Scoped to systemd on purpose. pm2 sets `pm_id`, but it is inherited the
  * same way and pm2's God daemon — not PID 1 — is the parent, so there is no
@@ -51,9 +90,58 @@ import { dshArgv, nodeExecutable } from './dsh-cli.ts'
 export function detectedSupervisor(
   env: NodeJS.ProcessEnv = process.env,
   ppid: number = process.ppid,
+  parentComm: (pid: number) => string | null = readParentComm,
 ): string | null {
   const set = (name: string): boolean => (env[name] ?? '') !== ''
-  if ((set('INVOCATION_ID') || set('JOURNAL_STREAM')) && ppid === 1) return 'systemd'
+  if (!set('INVOCATION_ID') && !set('JOURNAL_STREAM')) return null
+  if (ppid === 1 || parentComm(ppid) === 'systemd') return 'systemd'
+  return null
+}
+
+/** The comm of `pid` from /proc, or null wherever that cannot be read. */
+function readParentComm(pid: number): string | null {
+  try {
+    return readFileSync(`/proc/${String(pid)}/comm`, 'utf8').trim()
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Whether this host process is under a debugger, when one can be identified —
+ * `'inspector'` or `null`.
+ *
+ * Parallel to `detectedSupervisor()` (#229): a runtime latch for the restart
+ * route and status poll, NOT an entry in `restartAllowed()`. Folding it into
+ * `restartAllowed()` would write `allowRestart: false` through the settings
+ * page while a debug session is open, and the switch would stay off after
+ * the debugger detaches (#447).
+ *
+ * An explicit `allowRestart: true` does NOT override this latch either —
+ * unlike systemd, there is no documented deployment shape where killing a
+ * debug-attached host from the market UI is the right answer.
+ *
+ * Primary signal: `inspector.url()` is set (covers `--inspect` at boot,
+ * `inspector.open()`, and SIGUSR1 attach). Secondary: inspect-family flags
+ * in `execArgv` and `NODE_OPTIONS`, matched by token prefix — not a
+ * `/inspect/` substring, so script paths like `.../inspect-tool.js` do not
+ * false-positive. Includes `--inspect-wait` for Node versions that expose it
+ * as a distinct flag before `inspector.url()` is populated.
+ *
+ * Accepted false positive (same trade as #229 not guessing pm2): a host left
+ * listening on an inspector port — including `NODE_OPTIONS=--inspect` with
+ * nobody attached — is treated as debug-owned and gets no one-click restart.
+ */
+export function detectedDebugger(
+  inspectorUrl: string | undefined = inspector.url(),
+  execArgv: readonly string[] = process.execArgv,
+  nodeOptions: string = process.env.NODE_OPTIONS ?? '',
+): 'inspector' | null {
+  if (debuggerOverride !== undefined) return debuggerOverride
+  if (inspectorUrl !== undefined && inspectorUrl !== '') return 'inspector'
+  if (argvHasInspectFlag(execArgv)) return 'inspector'
+  const options = nodeOptions.trim()
+  if (options !== '' && argvHasInspectFlag(options.split(/\s+/u))) return 'inspector'
   return null
 }
 

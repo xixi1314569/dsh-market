@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { detectedSupervisor, respawnInvocation, restartAllowed, trustedDownloadRequest, trustedRestartRequest } from '../src/restart.ts'
+import { detectedDebugger, detectedSupervisor, respawnInvocation, restartAllowed, trustedDownloadRequest, trustedRestartRequest } from '../src/restart.ts'
 
 const LAUNCH = { file: 'C:\\Program Files\\nodejs\\node.exe', args: ['--import', 'tsx/esm', 'bin.ts', '--profile', 'web'], viaShell: false }
 
@@ -150,8 +150,28 @@ describe('supervisor detection gates self-restart (#229)', () => {
     // unit. Reading inheritance as ownership would hide the button on a
     // large population of hosts where restart works fine — a worse bug than
     // the one being fixed.
-    expect(detectedSupervisor({ INVOCATION_ID: 'abc123' }, 4242)).toBeNull()
-    expect(detectedSupervisor({ JOURNAL_STREAM: '8:12345' }, 4242)).toBeNull()
+    //
+    // The parent's comm is injected: on the Linux CI runner the default
+    // implementation would read the REAL /proc entry of whatever happens to
+    // own pid 4242, and the assertion would depend on the runner's process
+    // table.
+    expect(detectedSupervisor({ INVOCATION_ID: 'abc123' }, 4242, () => 'bash')).toBeNull()
+    expect(detectedSupervisor({ JOURNAL_STREAM: '8:12345' }, 4242, () => 'Runner.Worker')).toBeNull()
+    // No /proc to consult (macOS, or the pid vanished) keeps the old answer.
+    expect(detectedSupervisor({ INVOCATION_ID: 'abc123' }, 4242, () => null)).toBeNull()
+  })
+
+  it('names systemd for a per-user unit, whose manager is not PID 1 (#471)', () => {
+    // A user unit's service is forked by that user's `systemd --user`
+    // instance — an ordinary pid. Reading that as "unsupervised" is how
+    // one-click restart killed a user-unit host for good: clean SIGTERM
+    // exit, Restart=on-failure does not fire, KillMode=mixed SIGKILLs the
+    // detached helper before it can spawn the replacement.
+    expect(detectedSupervisor({ INVOCATION_ID: 'abc123' }, 1759, () => 'systemd')).toBe('systemd')
+    expect(detectedSupervisor({ JOURNAL_STREAM: '8:1' }, 1759, () => 'systemd')).toBe('systemd')
+    // The comm alone is not enough — the env marker is still required, so a
+    // bare child of some unrelated process named systemd does not count.
+    expect(detectedSupervisor({}, 1759, () => 'systemd')).toBeNull()
   })
 
   it('defaults restart OFF under a detected supervisor and ON without one', () => {
@@ -168,5 +188,35 @@ describe('supervisor detection gates self-restart (#229)', () => {
     expect(restartAllowed({ allowRestart: true }, { INVOCATION_ID: 'abc123' }, 1)).toBe(true)
     // ...and the documented opt-out still works with no supervisor detected.
     expect(restartAllowed({ allowRestart: false }, {}, 4242)).toBe(false)
+  })
+})
+
+describe('debugger detection gates self-restart (#447)', () => {
+  it('names inspector when inspector.url() is set', () => {
+    expect(detectedDebugger('ws://127.0.0.1:9229/uuid', [], '')).toBe('inspector')
+  })
+
+  it('detects inspect-family flags in execArgv by token prefix', () => {
+    expect(detectedDebugger(undefined, ['--inspect=9229'], '')).toBe('inspector')
+    expect(detectedDebugger(undefined, ['--inspect-brk'], '')).toBe('inspector')
+    expect(detectedDebugger(undefined, ['--inspect-port=9230'], '')).toBe('inspector')
+    expect(detectedDebugger(undefined, ['--inspect-wait'], '')).toBe('inspector')
+    expect(detectedDebugger(undefined, ['--debug-brk'], '')).toBe('inspector')
+  })
+
+  it('detects inspect flags in NODE_OPTIONS', () => {
+    expect(detectedDebugger(undefined, [], '--inspect=9229')).toBe('inspector')
+    expect(detectedDebugger(undefined, [], 'NODE_OPTIONS unrelated --inspect-brk')).toBe('inspector')
+  })
+
+  it('does not false-positive on unrelated argv tokens', () => {
+    expect(detectedDebugger(undefined, ['--enable-source-maps'], '')).toBeNull()
+    expect(detectedDebugger(undefined, ['/path/to/inspect-tool.js'], '')).toBeNull()
+    expect(detectedDebugger(undefined, [], '')).toBeNull()
+  })
+
+  it('does not fold into restartAllowed — explicit allowRestart stays true', () => {
+    expect(restartAllowed({ allowRestart: true }, {}, 4242)).toBe(true)
+    expect(detectedDebugger('ws://127.0.0.1:9229/uuid', [], '')).toBe('inspector')
   })
 })

@@ -198,10 +198,44 @@ describe('Anywhere Labs install boundary (#215, #219, #272)', () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ version: '2.3.4' }), { status: 200 })))
     const { service, plain, boundary } = boundaryService()
     const runtime = createDesktopPluginRuntime(service, profileFixture(), '/tmp', 10_000)
-    await runtime.runPlugin('web', ['add', 'example-plugin'])
+    const result = await runtime.runPlugin('web', ['add', 'example-plugin'])
     expect(plain, 'add went down the path their host refuses').toHaveLength(0)
     expect(boundary[0]?.args).toContain('example-plugin@2.3.4')
+    // Update verification must see the pin this host actually sent (#496).
+    expect(result.resolvedNpmVersion).toBe('2.3.4')
     await runtime.dispose()
+  })
+
+  it('reports an already-exact add target as resolvedNpmVersion without re-fetching', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ version: '9.9.9' }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { service, boundary } = boundaryService()
+    const runtime = createDesktopPluginRuntime(service, profileFixture(), '/tmp', 10_000)
+    const result = await runtime.runPlugin('web', ['add', 'example-plugin@1.2.3'])
+    expect(boundary[0]?.args).toContain('example-plugin@1.2.3')
+    expect(result.resolvedNpmVersion).toBe('1.2.3')
+    expect(fetchMock).not.toHaveBeenCalled()
+    await runtime.dispose()
+  })
+
+  it('reports the exact rollback targets its host boundary can execute', async () => {
+    const { service } = boundaryService()
+    const restricted = createDesktopPluginRuntime(service, profileFixture(), '/tmp', 10_000)
+    expect(restricted.supportsExactRollbackTarget?.('example-plugin@1.2.3')).toBe(true)
+    expect(restricted.supportsExactRollbackTarget?.('github:owner/repo#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')).toBe(false)
+    expect(restricted.supportsExactRollbackTarget?.('https://github.com/o/r/releases/download/v1.0.0/plugin.tgz')).toBe(false)
+    await restricted.dispose()
+
+    const ordinary = createDesktopPluginRuntime({
+      runPlugin() {
+        return {
+          stdout: new PassThrough(), stderr: new PassThrough(),
+          done: Promise.resolve({ exitCode: 0, signal: null }), cancel: () => {},
+        }
+      },
+    }, profileFixture(), '/tmp', 10_000)
+    expect(ordinary.supportsExactRollbackTarget?.('github:owner/repo#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')).toBe(true)
+    await ordinary.dispose()
   })
 
   /** #138: falling back is right, but their refusal ("must use the

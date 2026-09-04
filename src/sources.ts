@@ -183,7 +183,29 @@ function repoFromTarget(spec: string): { repo: string; subpath: string | null } 
   // same reason profile.ts does: the proxy sits in FRONT of the real URL,
   // so anchoring the pattern would see only the proxy's own hostname.
   const tarball = /codeload\.github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/tar\.gz\/[0-9a-f]{40}/.exec(spec)
-  return tarball === null ? null : { repo: tarball[1]!, subpath: null }
+  if (tarball !== null) return { repo: tarball[1]!, subpath: null }
+  return null
+}
+
+/**
+ * Extract a GitHub repo URL from a URL that may be a Release asset tarball
+ * (the format used by the catalog: releases/latest/download/ or
+ * releases/download/vX.Y.Z/).
+ *
+ * THIS IS FOR DISPLAY/LOOKUP PURPOSES ONLY — e.g., finding update notes for a
+ * plugin installed via npm. It MUST NOT be used for any decision that affects
+ * installation, rollback, duplicate detection, or build-script approval.
+ * Those paths use `repoFromTarget` / `repoOfTarget` which are stricter and
+ * intentionally do NOT recognize Release asset URLs (because the same asset
+ * URL can serve different bytes at different times).
+ */
+export function lookupRepoFromUrl(url: string): string | null {
+  // A GitHub Release asset tarball (used by the catalog), e.g.
+  // https://github.com/owner/repo/releases/latest/download/name.tgz
+  // https://github.com/owner/repo/releases/download/v1.0.0/name.tgz
+  const releaseAsset = /github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/releases\/(?:latest\/download|download\/[^/]+)\/[^/]+\.(?:tgz|tar\.gz)/i.exec(url)
+  if (releaseAsset !== null) return `https://github.com/${releaseAsset[1]!}`
+  return null
 }
 
 /**
@@ -198,6 +220,27 @@ export function repoOfTarget(spec: string): string | null {
   if (parsed === null) return null
   const repo = parsed.repo.toLowerCase()
   return parsed.subpath === null ? repo : `${repo}#path:/${parsed.subpath.toLowerCase()}`
+}
+
+/**
+ * The branch or tag a GitHub spec selects, or null for the default branch.
+ *
+ * Update detection has to ask about the same ref the install used, or it
+ * compares the installed commit against a line the user never chose (#446).
+ * A commit pin yields null: the answer for a pinned install is the default
+ * branch, which is what "is there something newer" means there.
+ */
+export function githubRefOfTarget(spec: string): string | null {
+  if (!spec.startsWith('github:')) return null
+  const fragmentAt = spec.indexOf('#')
+  if (fragmentAt === -1) return null
+  for (const selector of spec.slice(fragmentAt + 1).split('&')) {
+    if (selector === '' || selector.startsWith('path:/')) continue
+    if (/^[0-9a-f]{40}$/i.test(selector)) continue
+    if (selector.startsWith('semver:')) continue
+    return selector
+  }
+  return null
 }
 
 /**
@@ -300,70 +343,7 @@ export function isLocalSpec(spec: string): boolean {
   return /^(?:link|file):/i.test(spec)
 }
 
-/**
- * Keys a catalog URL contributes to restore matching.
- * A `/tree/` entry is ONLY its exact `#path:` id — never the bare repo —
- * so a collection-root identity cannot select a sibling subpackage.
- */
-function catalogMatchKeys(url: string): { path: string | null; repo: string | null } {
-  const source = parseSourceUrl(url)
-  if (source === null) return { path: null, repo: null }
-  const repo = source.repo.toLowerCase()
-  return source.subpath === null
-    ? { path: null, repo }
-    : { path: `${repo}#path:/${source.subpath.toLowerCase()}`, repo: null }
-}
-
-/**
- * The catalog entry a locally linked / file: install should restore to.
- * Exact `#path:` identities win, then collection-root identities against
- * root-only catalog rows, then a unique name/npm match. A bare repo identity
- * never selects a root row while `/tree/` siblings exist for that repo —
- * the checkout did not say which package it is, and guessing wrong installs
- * a different plugin. Same-named forks without identities or a matching hint
- * stay unmatched rather than guessing.
- */
-export function findCatalogEntryForLocal<T extends { name: string; npm?: string | null; url: string }>(
-  plugins: readonly T[],
-  name: string,
-  identities: readonly string[] = [],
-  hints: readonly string[] = [],
-): T | null {
-  const nameKey = name.toLowerCase()
-  const byName = plugins.filter(plugin =>
-    plugin.name.toLowerCase() === nameKey
-    || (typeof plugin.npm === 'string' && plugin.npm.toLowerCase() === nameKey),
-  )
-  const identitySet = new Set(identities.map(value => value.toLowerCase()))
-  const hintSet = new Set(hints.map(value => value.toLowerCase()))
-  const treeRepos = new Set<string>()
-  for (const plugin of plugins) {
-    const keys = catalogMatchKeys(plugin.url)
-    if (keys.path !== null) treeRepos.add(keys.path.slice(0, keys.path.indexOf('#path:/')))
-  }
-  if (identitySet.size > 0) {
-    const pathHit = plugins.find(plugin => {
-      const keys = catalogMatchKeys(plugin.url)
-      return keys.path !== null && identitySet.has(keys.path)
-    })
-    if (pathHit !== undefined) return pathHit
-    const rootHit = plugins.find(plugin => {
-      const keys = catalogMatchKeys(plugin.url)
-      if (keys.repo === null || !identitySet.has(keys.repo)) return false
-      return !treeRepos.has(keys.repo) || byName.includes(plugin)
-    })
-    if (rootHit !== undefined) return rootHit
-  }
-  if (byName.length === 1) return byName[0]!
-  if (byName.length > 1 && hintSet.size > 0) {
-    const hinted = byName.find((plugin) => {
-      const keys = catalogMatchKeys(plugin.url)
-      return (keys.path !== null && hintSet.has(keys.path)) || (keys.repo !== null && hintSet.has(keys.repo))
-    })
-    if (hinted !== undefined) return hinted
-  }
-  return null
-}
+export { findCatalogEntryForLocal, resolveCatalogRestore } from './catalog-local-match.ts'
 
 /**
  * pnpm add target for restoring a local checkout onto a catalog entry.
