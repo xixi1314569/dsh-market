@@ -3369,6 +3369,191 @@ export function mountMarketRoutes(
         }
       },
     }),
+
+    host.webServer.register({
+      kind: 'exact',
+      path: '/dsh-market/install-custom',
+      handler: async (request, response) => {
+        if (request.method !== 'POST') {
+          response.writeHead(405, { allow: 'POST' })
+          response.end()
+          return
+        }
+        if (!sameOrigin(request)) {
+          sendJson(response, 403, { error: 'untrusted origin' })
+          return
+        }
+        try {
+          await withMutationLock(response, 'install', async () => {
+            const body = (await readJsonBody(request)) as { command?: unknown; target?: unknown }
+            const busyAgents = runningAgentsForGuard()
+            if (busyAgents.length > 0) {
+              logEvent('warn', 'install-blocked', `refused while agents are running — ${busyAgents.join(', ')}`)
+              sendJson(response, 409, {
+                error: `有 agent 正在运行（${busyAgents.join(', ')}）。安装会修改插件文件，正在工作的 agent 可能在中途报错；请等它完成或取消后再安装。 / ${busyAgents.length === 1 ? 'An agent is running' : 'Agents are running'} (${busyAgents.join(', ')}). Installing changes plugin files, so a working agent can fail mid-turn; wait for it to finish (or cancel it) before installing.`,
+                agentsBusy: true,
+                runningAgents: busyAgents,
+              })
+              return
+            }
+            const raw = typeof body.command === 'string' ? body.command.trim() : typeof body.target === 'string' ? body.target.trim() : ''
+            if (!raw) {
+              sendJson(response, 400, { error: '安装命令或目标包名不能为空 / command or target cannot be empty' })
+              return
+            }
+            let target = raw
+            const addMatch = /(?:^|\s+)add\s+([^\s]+)/.exec(raw)
+            if (addMatch !== null) {
+              target = addMatch[1].trim()
+            } else if (raw.startsWith('dsh ')) {
+              const parts = raw.split(/\s+/).filter(p => !p.startsWith('-') && p !== 'dsh' && p !== 'plugin' && p !== 'add')
+              if (parts.length > 0) {
+                target = parts[parts.length - 1]
+              }
+            }
+
+            target = target.replace(/^['"]|['"]$/g, '')
+
+            if (!target || /[;&|`$\n\r]/.test(target)) {
+              sendJson(response, 400, { error: '无效或包含不安全字符的安装目标 / invalid or unsafe install target' })
+              return
+            }
+
+            const beforeSpecs = readInstalled(config.profile, activeProfileDir)
+            const before = new Set(Object.keys(beforeSpecs))
+            pendingRollbacks.clear()
+            const compatibilityBefore = assessProfile(config.profile, activeProfileDir)
+            const bundlesBefore = brokenClientBundles(config.profile, activeProfileDir)
+            const manifestBefore = readProfileManifestSnapshot(config.profile, activeProfileDir)
+
+            logEvent('info', 'install-custom', `installing custom target: ${target}`)
+            const result = await runPlugin(config.profile, ['add', target])
+            const cancelled = result.cancelled
+            if ((result.exitCode !== 0 || result.timedOut) && !cancelled) {
+              const rolledBack = restoreProfileManifest(config.profile, manifestBefore, activeProfileDir)
+              if (rolledBack.length > 0) {
+                logEvent('warn', 'install-custom', `${target}: rolled back manifest residue of the failed run: ${rolledBack.join(', ')}`)
+              }
+            }
+
+            let ok = result.exitCode === 0 && !result.timedOut && !cancelled
+            const cancelDiff = cancelled ? changedSince(beforeSpecs) : null
+            if (ok) invalidateUpdates()
+            if (ok) {
+              ok = await retargetCollections(runPlugin, config.profile, before, target, activeProfileDir)
+            }
+
+            let notAPlugin = false
+            let addedNothing = false
+            let removedBroken: string[] = []
+            let conflicts: { name: string; id: string; owner: string }[] = []
+            if (result.exitCode === 0 && !result.timedOut && !cancelled) {
+              const validated = await validateAddedPlugins(runPlugin, config.profile, before, activeProfileDir)
+              removedBroken = validated.removedBroken
+              conflicts = validated.conflicts
+              if (removedBroken.length > 0) {
+                logEvent('warn', 'install-custom', `${target}: removed uninstallable pieces: ${removedBroken.join(', ')}`)
+              }
+              if (validated.keep.length === 0) {
+                ok = false
+                notAPlugin = true
+                addedNothing = validated.added.length === 0
+                logEvent('error', 'install-custom', addedNothing
+                  ? `${target}: the plugin command reported success but added nothing to the profile`
+                  : `${target}: nothing installable survived validation (added: ${validated.added.join(', ')})`)
+              } else {
+                ok = true
+              }
+            }
+
+            const conflictGroups = groupConflictsByOwner(conflicts)
+            const installed = readInstalled(config.profile, activeProfileDir)
+            let hot = false
+            let activation: Record<string, ReturnType<typeof verifyActivation>> | undefined
+            let compatibility: { code: 'soft-incompatible'; risks: CompatibilityRisk[]; shadowedNames?: DuplicateName[]; brokenBundles?: Array<{ name: string; reason: string }>; rollbackId: string } | undefined
+            let addedPackages: string[] = []
+            if (ok) {
+              const added = Object.keys(installed).filter(name => !before.has(name))
+              addedPackages = added
+              if (added.length > 0) {
+                for (const name of added) disabled.delete(name)
+                writeMarketState(activeProfileDir, { disabled, groups, groupOrder })
+                hot = true
+                for (const name of added) {
+                  const live = (await hotMount(host, activeProfileDir, name)).ok
+                  if (!live) hot = false
+                }
+                activation = {}
+                const live = liveNames()
+                for (const name of added) {
+                  activation[name] = verifyActivation(config.profile, name, live, activeProfileDir, disabled.has(name))
+                }
+              }
+
+              const compatibilityAfter = assessProfile(config.profile, activeProfileDir)
+              const risks = introducedRisks(compatibilityBefore, compatibilityAfter)
+              const shadowed = introducedDuplicateNames(compatibilityBefore, compatibilityAfter)
+              const brokenBundles = newlyBrokenBundles(
+                bundlesBefore,
+                [
+                  ...addedPackages
+                    .map(pkg => ({ name: pkg, check: checkClientBundle(config.profile, pkg, activeProfileDir) }))
+                    .filter(entry => !entry.check.ok)
+                    .map(entry => ({ name: entry.name, reason: entry.check.reason ?? 'parse failed' })),
+                  ...brokenClientBundles(config.profile, activeProfileDir),
+                ].filter((entry, index, all) => all.findIndex(other => other.name === entry.name) === index),
+              )
+              if (risks.length > 0 || shadowed.length > 0 || brokenBundles.length > 0) {
+                compatibility = {
+                  code: 'soft-incompatible',
+                  risks,
+                  shadowedNames: shadowed.length > 0 ? shadowed : undefined,
+                  brokenBundles: brokenBundles.length > 0 ? brokenBundles : undefined,
+                  rollbackId: savePendingRollback({ kind: 'install', names: addedPackages }),
+                }
+              }
+            }
+
+            logEvent(ok || cancelled ? 'info' : 'error', 'install-custom',
+              `${target} exit=${String(result.exitCode)}${result.timedOut ? ' TIMEOUT' : ''}${cancelled ? ' CANCELLED' : ''}${ok ? ` hot=${String(hot)}` : cancelled ? '' : ` err=${failureDetail(result)}`}`)
+            const ignoredBuilds = blockedBuilds(result)
+            sendJson(response, ok || cancelled ? 200 : result.busy === true ? 409 : 502, {
+              ok,
+              target,
+              cancelled: cancelled || undefined,
+              busy: result.busy || undefined,
+              hot,
+              partial: cancelDiff?.partial,
+              changed: cancelDiff?.changed,
+              activation,
+              compatibility,
+              ignoredBuilds,
+              addedPackages,
+              conflictGroups: conflictGroups.length > 0 ? conflictGroups : undefined,
+              error: conflictGroups.length > 0
+                ? `「${conflicts[0].name}」与已安装的 ${conflictGroups.map(group => `「${group.owner}」（${group.ids.join('、')}）`).join('、')} 占用相同的 loader 条目 id`
+                : addedNothing
+                  ? '安装命令报告成功，但 profile 没有任何变化。'
+                  : notAPlugin
+                    ? '没有可安装的内容：插件需要构建授权（allowBuilds，默认拦截）或未附带构建产物。'
+                    : Array.isArray(ignoredBuilds) && ignoredBuilds.length > 0
+                      ? `构建脚本被 pnpm 默认拦截（${ignoredBuilds.join(', ')}），请放行构建脚本并重试。`
+                      : result.stderr ? result.stderr.trim() : undefined,
+              exitCode: result.exitCode,
+              timedOut: result.timedOut,
+              stdout: result.stdout,
+              stderr: result.stderr,
+              installed,
+            })
+          })
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          host.logger?.warn(`[dsh-market] custom install failed: ${message}`)
+          logEvent('error', 'install-custom', `route error: ${message}`)
+          sendJson(response, 500, { error: message })
+        }
+      },
+    }),
   ]
 
   return () => {

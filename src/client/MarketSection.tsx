@@ -1051,6 +1051,153 @@ export interface MarketSectionProps {
   }
 }
 
+function CustomInstallPanel({
+  t,
+  refreshInstalled,
+  onGoToInstalled,
+}: {
+  t: Translate
+  refreshInstalled: (force?: boolean) => void
+  onGoToInstalled: () => void
+}) {
+  const [command, setCommand] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [logs, setLogs] = useState<string | null>(null)
+  const [status, setStatus] = useState<{ ok: boolean; message: string; target?: string } | null>(null)
+
+  const examples = [
+    'dsh plugin --profile web add @linxin666/dsh-web-all@latest',
+    '@linxin666/dsh-web-all@latest',
+    'dsh plugin --profile web add @deepseek-ai/dsh-theme-dark',
+    'github:username/dsh-plugin-sample',
+  ]
+
+  const handleInstall = async () => {
+    const trimmed = command.trim()
+    if (!trimmed || busy) return
+    setBusy(true)
+    setLogs(null)
+    setStatus(null)
+    try {
+      const res = await fetch(api('/dsh-market/install-custom'), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ command: trimmed }),
+      })
+      const body = await res.json()
+      const logParts = [body.stdout, body.stderr].filter(Boolean).map((s: string) => s.trim()).filter(Boolean)
+      if (body.error && !logParts.includes(body.error)) {
+        logParts.push(body.error)
+      }
+      setLogs(logParts.join('\n\n') || '(无日志输出 / No output log)')
+
+      if (res.status === 200 && body.ok) {
+        setStatus({
+          ok: true,
+          message: `${t('customInstallSuccess')} (${body.target || trimmed})`,
+          target: body.target,
+        })
+        refreshInstalled(true)
+      } else {
+        setStatus({
+          ok: false,
+          message: body.error || t('customInstallFailed'),
+        })
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      setStatus({ ok: false, message: msg })
+      setLogs(`Error: ${msg}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className={css.customWrapper}>
+      <section className={css.customCard}>
+        <h3>{t('customInstallTitle')}</h3>
+        <p>{t('customInstallDesc')}</p>
+
+        <div className={css.customExamples}>
+          <span className={css.customExamplesLabel}>{t('customExamples')}</span>
+          <div className={css.customChipList}>
+            {examples.map(ex => (
+              <button
+                key={ex}
+                type="button"
+                className={css.customChip}
+                onClick={() => setCommand(ex)}
+                title="点击填入"
+              >
+                {ex}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className={css.customInputBox}>
+          <textarea
+            className={css.customTextarea}
+            placeholder={t('customInstallPh')}
+            value={command}
+            onChange={e => setCommand(e.target.value)}
+            disabled={busy}
+            rows={3}
+          />
+        </div>
+
+        <div className={css.customBtnRow}>
+          {command && (
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={busy}
+              onClick={() => { setCommand(''); setStatus(null); setLogs(null) }}
+            >
+              {t('customClear')}
+            </Button>
+          )}
+          <Button
+            variant="primary"
+            size="sm"
+            disabled={!command.trim() || busy}
+            onClick={handleInstall}
+            icon={busy ? <IconLoadingOutline16 size={14} className={css.spin} /> : <IconDownloadOutline16 size={14} />}
+          >
+            {busy ? t('customInstalling') : t('customInstallBtn')}
+          </Button>
+        </div>
+
+        {status !== null && (
+          <div className={css.banner} style={{ borderColor: status.ok ? 'var(--dsw-alias-state-success-primary, #16a34a)' : 'var(--dsw-alias-state-error-primary, #dc2626)' }}>
+            <span style={{ color: status.ok ? 'var(--dsw-alias-state-success-primary, #16a34a)' : 'var(--dsw-alias-state-error-primary, #dc2626)', display: 'inline-flex', flexShrink: 0 }}>
+              {status.ok ? <IconCheckOutline16 size={16} /> : <IconWarningOutline16 size={16} />}
+            </span>
+            <span className={css.grow} style={{ color: status.ok ? 'var(--dsw-alias-state-success-primary, #16a34a)' : 'var(--dsw-alias-state-error-primary, #dc2626)' }}>
+              {status.message}
+            </span>
+            {status.ok && (
+              <Button variant="outline" size="sm" onClick={onGoToInstalled}>
+                {t('customGotoInstalled')}
+              </Button>
+            )}
+          </div>
+        )}
+
+        {logs !== null && (
+          <div className={css.customLogContainer}>
+            <div className={css.customLogTitle}>
+              <span>{t('customLogTitle')}</span>
+            </div>
+            <pre className={css.customTerminal}>{logs}</pre>
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}
+
 export function MarketSection(props: MarketSectionProps) {
   const t = props.t
   const initialWebdav = useMemo(savedWebdav, [])
@@ -3179,6 +3326,7 @@ export function MarketSection(props: MarketSectionProps) {
             {t('tabInstalled') + (installedOtherCount > 0 ? ' (' + installedOtherCount + ')' : '')}
             {hasUpdates && <StateDot state="error" size={7} className={css.dot} />}
           </button>
+          <button className={tab === 'custom' ? `${css.tab} ${css.on}` : css.tab} onClick={() => setTab('custom')}>{t('tabCustom')}</button>
           <button
             className={(tab === 'backup' || tab === 'diagnostics') ? `${css.tab} ${css.on}` : css.tab}
             onClick={() => { if (tab !== 'backup' && tab !== 'diagnostics') setTab('backup') }}
@@ -3677,6 +3825,14 @@ export function MarketSection(props: MarketSectionProps) {
               )
             : tab === 'diagnostics'
             ? <Diagnostics t={t} />
+            : tab === 'custom'
+            ? (
+                <CustomInstallPanel
+                  t={t}
+                  refreshInstalled={refreshInstalled}
+                  onGoToInstalled={() => { setTab('installed'); refreshInstalled(true) }}
+                />
+              )
             : (
                 <>
                   <div className={css.viewBar}>

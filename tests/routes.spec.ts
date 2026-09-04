@@ -727,3 +727,69 @@ describe('POST /dsh-market/restore-snapshot & /dsh-market/delete-snapshot', () =
     expect(String(jsonBody(res).error)).toMatch(/snapshot not found/)
   })
 })
+
+describe('POST /dsh-market/install-custom', () => {
+  it('rejects GET with 405', async () => {
+    const res = await hit(routes, '/dsh-market/install-custom', { method: 'GET', url: '/dsh-market/install-custom' })
+    expect(res.status).toBe(405)
+  })
+
+  it('rejects cross-origin requests with 403', async () => {
+    const res = await hit(routes, '/dsh-market/install-custom', {
+      method: 'POST',
+      url: '/dsh-market/install-custom',
+      headers: { host: HOST, origin: 'http://evil.com' },
+    })
+    expect(res.status).toBe(403)
+  })
+
+  it('rejects empty input with 400', async () => {
+    const res = await hit(routes, '/dsh-market/install-custom', post('/dsh-market/install-custom', { command: '   ' }))
+    expect(res.status).toBe(400)
+  })
+
+  it('rejects dangerous shell characters with 400', async () => {
+    const res = await hit(routes, '/dsh-market/install-custom', post('/dsh-market/install-custom', { command: 'pkg; rm -rf /' }))
+    expect(res.status).toBe(400)
+  })
+
+  it('parses full dsh CLI command and runs plugin add', async () => {
+    writeStandardProfile()
+    let invokedArgs: string[] | undefined
+    const runtime: PluginCommandRuntime = {
+      runPlugin: async (_profile, args) => {
+        invokedArgs = args
+        const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { dependencies: Record<string, string> }
+        manifest.dependencies['@linxin666/dsh-web-all'] = '^1.0.0'
+        writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest, null, 2))
+        const pkgDir = join(dir, 'node_modules', '@linxin666', 'dsh-web-all')
+        mkdirSync(pkgDir, { recursive: true })
+        writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({
+          name: '@linxin666/dsh-web-all',
+          version: '1.0.0',
+          main: 'lib/index.js',
+          dsh: { plugin: { id: 'linxin-plugin' } },
+        }))
+        mkdirSync(join(pkgDir, 'lib'), { recursive: true })
+        writeFileSync(join(pkgDir, 'lib', 'index.js'), 'module.exports = {}')
+        return {
+          exitCode: 0,
+          timedOut: false,
+          cancelled: false,
+          stdout: '+ @linxin666/dsh-web-all@1.0.0',
+          stderr: '',
+        }
+      },
+    }
+    const { routes: customRoutes } = mount(runtime)
+    const res = await hit(customRoutes, '/dsh-market/install-custom', post('/dsh-market/install-custom', {
+      command: 'dsh plugin --profile web add @linxin666/dsh-web-all@latest',
+    }))
+    expect(res.status).toBe(200)
+    expect(invokedArgs).toEqual(['add', '@linxin666/dsh-web-all@latest'])
+    const body = jsonBody(res)
+    expect(body.ok).toBe(true)
+    expect(body.target).toBe('@linxin666/dsh-web-all@latest')
+  })
+})
+
